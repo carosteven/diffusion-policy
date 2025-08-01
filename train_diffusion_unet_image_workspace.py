@@ -1,47 +1,39 @@
-from typing import Dict
-import pathlib
-import copy
-import dill
-import torch
-from torch.utils.data import DataLoader
-import threading
+if __name__ == "__main__":
+    import sys
+    import os
+    import pathlib
+
+    ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
+    sys.path.append(ROOT_DIR)
+    os.chdir(ROOT_DIR)
+
 import os
-import numpy as np
+import hydra
+import torch
+from omegaconf import OmegaConf
+import pathlib
+from torch.utils.data import DataLoader
+import copy
 import random
 import wandb
 import tqdm
-from hydra import initialize, compose
-from hydra.core.hydra_config import HydraConfig
-from omegaconf import OmegaConf
-from diffusers.training_utils import EMAModel
-
-# Diffusion Policy imports
-from diffusion_policy.diffusion_unet_lowdim_policy import DiffusionUnetLowdimPolicy
-from diffusion_policy.pusht_dataset import PushTLowdimDataset
+import numpy as np
+import shutil
 from diffusion_policy.base_workspace import BaseWorkspace
-from diffusion_policy.base_lowdim_runner import BaseLowdimRunner
-from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
-from diffusion_policy.common.json_logger import JsonLogger
+from diffusion_policy.diffusion_unet_image_policy import DiffusionUnetImagePolicy
+from diffusion_policy.base_dataset import BaseImageDataset
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
-from diffusion_policy.common.lr_scheduler import get_scheduler
-from diffusion_policy.base_dataset import BaseLowdimDataset
-from diffusion_policy.pusht_keypoints_runner import PushTKeypointsRunner
+from diffusion_policy.common.json_logger import JsonLogger
+from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.ema_model import EMAModel
+from diffusion_policy.common.lr_scheduler import get_scheduler
 
-from diffusion_policy.box_delivery_dataset import BoxDeliveryLowdimDataset
+OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-def load_and_evaluate_yaml(config_path, config_name):
-    # Initialize Hydra with the directory containing the YAML file
-    with initialize(config_path=config_path):
-        # Compose the configuration
-        cfg = compose(config_name=config_name)
-        # Convert to a dictionary for easier access
-        return OmegaConf.to_container(cfg, resolve=True)
-
-class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
+class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
-    def __init__(self, cfg, output_dir=None):
+    def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
 
         # set seed
@@ -51,20 +43,17 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
         random.seed(seed)
 
         # configure model
-        self.model: DiffusionUnetLowdimPolicy
-        # self.model = hydra.utils.instantiate(cfg.policy)
-        self.model = DiffusionUnetLowdimPolicy(**cfg.policy)
+        self.model: DiffusionUnetImagePolicy = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: DiffusionUnetLowdimPolicy = None
+        self.ema_model: DiffusionUnetImagePolicy = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
         # configure training state
-        # self.optimizer = hydra.utils.instantiate(
-        #     cfg.optimizer, params=self.model.parameters())
-        if cfg.optimizer_target == "AdamW":
-            self.optimizer = torch.optim.AdamW(params=self.model.parameters(), **cfg.optimizer)
+        self.optimizer = hydra.utils.instantiate(
+            cfg.optimizer, params=self.model.parameters())
 
+        # configure training state
         self.global_step = 0
         self.epoch = 0
 
@@ -79,15 +68,9 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 self.load_checkpoint(path=lastest_ckpt_path)
 
         # configure dataset
-        dataset: BaseLowdimDataset
-        # dataset = hydra.utils.instantiate(cfg.task.dataset)
-        if cfg.task.dataset_target == "PushTLowdimDataset":
-            dataset = PushTLowdimDataset(**cfg.task.dataset)
-        elif cfg.task.dataset_target == "BoxDeliveryLowdimDataset":
-            dataset = BoxDeliveryLowdimDataset(**cfg.task.dataset)
-
-        print(f"Dataset: {dataset}")
-        assert isinstance(dataset, BaseLowdimDataset)
+        dataset: BaseImageDataset
+        dataset = hydra.utils.instantiate(cfg.task.dataset)
+        assert isinstance(dataset, BaseImageDataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
@@ -115,18 +98,16 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
         # configure ema
         ema: EMAModel = None
         if cfg.training.use_ema:
-            # ema = hydra.utils.instantiate(
-            #     cfg.ema,
-            #     model=self.ema_model)
-            ema = EMAModel(model=self.ema_model, **cfg.ema)
+            ema = hydra.utils.instantiate(
+                cfg.ema,
+                model=self.ema_model)
 
-        # configure env runner
-        # env_runner: BaseLowdimRunner
-        # # env_runner = hydra.utils.instantiate(
-        # #     cfg.task.env_runner,
-        # #     output_dir=self.output_dir)
-        # env_runner = PushTKeypointsRunner(output_dir=self.output_dir, **cfg.task.env_runner)
-        # assert isinstance(env_runner, BaseLowdimRunner)
+        # configure env
+        # env_runner: BaseImageRunner
+        # env_runner = hydra.utils.instantiate(
+        #     cfg.task.env_runner,
+        #     output_dir=self.output_dir)
+        # assert isinstance(env_runner, BaseImageRunner)
 
         # configure logging
         wandb_run = wandb.init(
@@ -141,15 +122,10 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
         )
 
         # configure checkpoint
-        # topk_manager = TopKCheckpointManager(
-        #     save_dir=os.path.join(self.output_dir, 'checkpoints'),
-        #     **cfg.checkpoint.topk
-        # )
         topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join('PositionDiffusionPolicy/checkpoint/', str(self.cfg.training.job_id)),
+            save_dir=os.path.join(self.output_dir, 'checkpoints'),
             **cfg.checkpoint.topk
         )
-
 
         # device transfer
         device = torch.device(cfg.training.device)
@@ -176,6 +152,10 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
             for local_epoch_idx in range(cfg.training.num_epochs):
                 step_log = dict()
                 # ========= train for this epoch ==========
+                if cfg.training.freeze_encoder:
+                    self.model.obs_encoder.eval()
+                    self.model.obs_encoder.requires_grad_(False)
+
                 train_losses = list()
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
@@ -221,7 +201,7 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                         if (cfg.training.max_train_steps is not None) \
                             and batch_idx >= (cfg.training.max_train_steps-1):
                             break
-                
+
                 # at the end of each epoch
                 # replace train_loss with epoch average
                 train_loss = np.mean(train_losses)
@@ -261,22 +241,14 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
-                        batch = train_sampling_batch
-                        obs_dict = {'obs': batch['obs']}
+                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                        obs_dict = batch['obs']
                         gt_action = batch['action']
                         
                         result = policy.predict_action(obs_dict)
-                        if cfg.pred_action_steps_only:
-                            pred_action = result['action']
-                            start = cfg.n_obs_steps - 1
-                            end = start + cfg.n_action_steps
-                            gt_action = gt_action[:,start:end]
-                        else:
-                            pred_action = result['action_pred']
+                        pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                        # log
                         step_log['train_action_mse_error'] = mse.item()
-                        # release RAM
                         del batch
                         del obs_dict
                         del gt_action
@@ -315,12 +287,12 @@ class TrainDiffusionUnetLowdimWorkspace(BaseWorkspace):
                 self.global_step += 1
                 self.epoch += 1
 
-# @hydra.main(
-#     version_base=None,
-#     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
-#     config_name=pathlib.Path(__file__).stem)
+@hydra.main(
+    version_base=None,
+    config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
+    config_name=pathlib.Path(__file__).stem)
 def main(cfg):
-    workspace = TrainDiffusionUnetLowdimWorkspace(cfg)
+    workspace = TrainDiffusionUnetImageWorkspace(cfg)
     workspace.run()
 
 if __name__ == "__main__":
